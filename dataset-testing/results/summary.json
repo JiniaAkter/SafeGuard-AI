@@ -1,0 +1,69 @@
+{
+  "usable_files": 109,
+  "total_hours": 7.76,
+  "violent_hours": 0.85,
+  "violent_windows": 1027,
+  "non_violent_windows": 8023,
+  "non_violent_from_noviolence_files": 6035,
+  "balance_ratio": 7.81,
+  "violence_range_s": {
+    "shortest": 0.66,
+    "average": 9.62,
+    "longest": 141.26
+  },
+  "file_length_s": {
+    "shortest": 15.0,
+    "average": 256.2,
+    "longest": 4966.0
+  },
+  "sample_rates": {
+    "44100": 109
+  },
+  "channels": {
+    "2": 109
+  },
+  "unreadable": 0,
+  "duplicates": 0,
+  "missing_audio": [],
+  "unlabelled_audio": [
+    "angry_206"
+  ],
+  "skipped_uncut_originals": 21,
+  "length_mismatch_files": [
+    "angry_093"
+  ],
+  "violent_recall": 0.554,
+  "violent_precision": 0.837,
+  "noise_test": [
+    {
+      "condition": "clean",
+      "violent_recall": 0.554,
+      "false_alarm_rate": 0.123
+    },
+    {
+      "condition": "noise 20 dB",
+      "violent_recall": 0.862,
+      "false_alarm_rate": 0.07
+    },
+    {
+      "condition": "noise 10 dB",
+      "violent_recall": 0.692,
+      "false_alarm_rate": 0.018
+    },
+    {
+      "condition": "noise 0 dB",
+      "violent_recall": 0.108,
+      "false_alarm_rate": 0.0
+    }
+  ],
+  "checks": {
+    "All files open": true,
+    "No duplicate files": true,
+    "Every labelled file has audio": true,
+    "Every segment audio file has labels": false,
+    "File lengths match the Excel file": false,
+    "Classes balanced (ratio <= 3)": false,
+    "Model catches >= 85% violent windows": false,
+    "Still >= 70% with medium noise (10 dB)": false
+  }
+}
