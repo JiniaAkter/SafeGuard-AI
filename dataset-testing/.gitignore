@@ -1,0 +1,9 @@
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+data/
+kaggle.json
+.ipynb_checkpoints/
+dataset/
