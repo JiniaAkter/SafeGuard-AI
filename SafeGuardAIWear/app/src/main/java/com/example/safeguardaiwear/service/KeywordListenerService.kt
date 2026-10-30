@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
@@ -38,8 +39,10 @@ import java.io.File
  *
  *  - While listening, nothing is saved. Only the last [PRE_ROLL_SECONDS] seconds
  *    are kept in memory and continuously thrown away.
- *  - Saying the phrase starts a recording (the 5 seconds before are included)
- *    and the watch vibrates once.
+ *  - Saying the phrase starts a recording and the watch vibrates once. If the
+ *    "include 5 seconds before" setting is on, the pre-roll is added to the start.
+ *  - While a recording is being played back, phrase detection is paused, so the
+ *    phrase inside the recording can't start a new recording.
  *  - Saying the phrase again, tapping "Stop recording", or reaching
  *    [MAX_RECORDING_MS] stops it and the watch vibrates twice.
  *  - Recordings are saved as .m4a (AAC) with a .sha256 fingerprint.
@@ -69,8 +72,26 @@ class KeywordListenerService : Service() {
         val recordingStartedAt: StateFlow<Long> = _recordingStartedAt
 
         /** Last words the recogniser heard from the phrase – helps when testing. */
+        /** True while listening is paused because audio is playing on the watch. */
+        private val _paused = MutableStateFlow(false)
+        val paused: StateFlow<Boolean> = _paused
+
         private val _heard = MutableStateFlow("")
         val heard: StateFlow<String> = _heard
+
+        /** True while the app is playing a recording out loud. */
+        @Volatile
+        private var playbackActive = false
+
+        /** Ignore the phrase until this time (echo after playback ends). */
+        @Volatile
+        private var ignoreUntil = 0L
+
+        /** Called by the app when it starts / stops playing a recording. */
+        fun setPlaybackActive(active: Boolean) {
+            playbackActive = active
+            if (!active) ignoreUntil = System.currentTimeMillis() + 1_500
+        }
 
         /** Starts listening. Returns an error message, or null if it started. */
         fun start(context: Context): String? {
@@ -133,8 +154,16 @@ class KeywordListenerService : Service() {
             return START_NOT_STICKY
         }
 
-        // Must be called promptly after startForegroundService().
-        startInForeground("Starting…")
+        // Must be called promptly after startForegroundService(). If Android restarts
+        // the service in the background it may refuse; the app then restarts
+        // listening the next time it is opened.
+        try {
+            startInForeground("Starting…")
+        } catch (e: Exception) {
+            Log.w(TAG, "Not allowed to start listening right now", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         val prefs = SafeGuardPrefs(this)
         val phrase = prefs.secretPhrase
@@ -149,11 +178,13 @@ class KeywordListenerService : Service() {
             acquireWakeLock()
             worker = Thread({ listenLoop(phrase!!) }, "safeguard-listener").also { it.start() }
         }
-        return START_NOT_STICKY
+        // STICKY: if Android kills the service, it is started again automatically.
+        return START_STICKY
     }
 
     override fun onDestroy() {
         running = false
+        _paused.value = false
         worker?.join(3_000)
         worker = null
         wakeLock?.let { if (it.isHeld) it.release() }
@@ -179,20 +210,31 @@ class KeywordListenerService : Service() {
         }
 
         // Only listen for the phrase (anything else becomes "[unk]").
-        val grammar = JSONArray(listOf(phrase, "[unk]")).toString()
-        val recognizer = Recognizer(model, SAMPLE_RATE.toFloat(), grammar)
+        // The vocabulary is the full phrase, its shorter beginnings and each single
+        // word. Without the shorter options the recogniser "completes" the phrase
+        // when only part of it was said (e.g. "purple pineapple" -> "... tea").
+        val words = phrase.split(" ")
+        val options = buildList {
+            for (n in words.size downTo 1) add(words.take(n).joinToString(" "))
+            addAll(words)
+            add("[unk]")
+        }.distinct()
+        val grammar = JSONArray(options).toString()
+        fun newRecognizer() = Recognizer(model, SAMPLE_RATE.toFloat(), grammar)
+        var recognizer = newRecognizer()
 
         val chunkBytes = SAMPLE_RATE / 5 * 2 // 200 ms of 16-bit audio
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
-        val audioRecord = AudioRecord(
+        fun newAudioRecord() = AudioRecord(
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuffer, chunkBytes) * 2
         )
+        var audioRecord = newAudioRecord()
         if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
             audioRecord.release()
             recognizer.close()
@@ -201,12 +243,30 @@ class KeywordListenerService : Service() {
         }
 
         val buffer = ByteArray(chunkBytes)
+        var silentSince = 0L
+
+        /**
+         * Closes and reopens the microphone. After audio has played (or if the
+         * system silenced us) the old microphone stream can keep delivering
+         * silence – reopening it is what "turn protection off and on" used to fix.
+         */
+        fun restartMic() {
+            try { audioRecord.stop() } catch (_: Exception) { }
+            audioRecord.release()
+            audioRecord = newAudioRecord()
+            audioRecord.startRecording()
+            silentSince = 0L
+            Log.i(TAG, "Microphone restarted")
+        }
         val preRoll = ArrayDeque<ByteArray>()
         val preRollLimit = SAMPLE_RATE * 2 * PRE_ROLL_SECONDS
         var preRollBytes = 0
 
         var writer: AacWriter? = null
-        var ignoreUntilFinal = false
+        var wasPaused = false
+        var lastAudioAt = 0L
+        val prefs = SafeGuardPrefs(this)
+        val audioManager = getSystemService(AudioManager::class.java)
 
         fun beginRecording() {
             val file = File(recordingsDir(this), "recording_${System.currentTimeMillis()}.m4a")
@@ -217,7 +277,9 @@ class KeywordListenerService : Service() {
                 _error.value = "Could not create recording file"
                 return
             }
-            preRoll.forEach { chunk -> newWriter.write(chunk, chunk.size) }
+            if (prefs.includePreRoll) {
+                preRoll.forEach { chunk -> newWriter.write(chunk, chunk.size) }
+            }
             preRoll.clear()
             preRollBytes = 0
             writer = newWriter
@@ -273,8 +335,33 @@ class KeywordListenerService : Service() {
                     }
                 }
 
-                // Check both the in-progress (partial) and finished results so the
-                // phrase is caught quickly.
+                // Pause detection while ANY audio plays on the watch (our recordings,
+                // music, videos …) and for 1.5 s after, so sound from the speaker
+                // can't trigger a recording. Listening resumes by itself.
+                val now = System.currentTimeMillis()
+                if (playbackActive || audioManager.isMusicActive) lastAudioAt = now
+                if (now - lastAudioAt < 1_500 || now < ignoreUntil) {
+                    if (!wasPaused) _paused.value = true
+                    wasPaused = true
+                    continue
+                }
+                if (wasPaused) {
+                    _paused.value = false
+                    // Throw away the played-back sound and start detection completely
+                    // fresh (new recogniser), so listening works straight away.
+                    wasPaused = false
+                    preRoll.clear()
+                    preRollBytes = 0
+                    _heard.value = ""
+                    recognizer.close()
+                    recognizer = newRecognizer()
+                    restartMic()
+                    continue
+                }
+
+                // Partial results only update the "Heard" text on screen. The phrase
+                // only counts once the sentence is finished (short pause after it),
+                // so all words, including the last one, must really have been said.
                 val isFinal = recognizer.acceptWaveForm(buffer, read)
                 val raw = if (isFinal) {
                     JSONObject(recognizer.result).optString("text")
@@ -284,11 +371,8 @@ class KeywordListenerService : Service() {
                 val text = raw.replace("[unk]", " ").trim().replace(Regex("\\s+"), " ")
                 if (text.isNotEmpty()) _heard.value = text
 
-                if (ignoreUntilFinal) {
-                    // The phrase that just triggered us is still in this sentence – skip it.
-                    if (isFinal) ignoreUntilFinal = false
-                } else if (" $text ".contains(" $phrase ")) {
-                    ignoreUntilFinal = !isFinal
+                if (isFinal) Log.i(TAG, "Heard (final): '$text'")
+                if (isFinal && " $text ".contains(" $phrase ")) {
                     if (writer == null) beginRecording() else endRecording()
                 }
 

@@ -65,6 +65,8 @@ class MainActivity : ComponentActivity() {
     private var busy by mutableStateOf(false)
     private var pendingPhrase by mutableStateOf("")
     private var showPhrase by mutableStateOf(false)
+    private var settingsVersion by mutableIntStateOf(0)
+    private var playedSinceRestart = false
     private var recordingsVersion by mutableIntStateOf(0)
     private var playingPath by mutableStateOf<String?>(null)
     private var confirmDeletePath by mutableStateOf<String?>(null)
@@ -145,6 +147,13 @@ class MainActivity : ComponentActivity() {
             KeywordListenerService.stop(this)
             prefs.withdrawConsent()
             navigate(Screen.CONSENT)
+            return
+        }
+        // Protection is meant to be on but Android stopped the listener -> restart it.
+        if (prefs.protectionOn && prefs.consentGiven && !prefs.secretPhrase.isNullOrBlank() &&
+            KeywordListenerService.state.value == State.STOPPED
+        ) {
+            KeywordListenerService.start(this)?.let { message = it }
         }
     }
 
@@ -156,6 +165,14 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------------- actions
 
     private fun navigate(to: Screen) {
+        // Leaving the Recordings screen stops playback, so listening resumes at once.
+        if (screen == Screen.RECORDINGS && to != Screen.RECORDINGS) {
+            stopPlayback()
+            if (playedSinceRestart) {
+                playedSinceRestart = false
+                restartListening()
+            }
+        }
         message = null
         confirmDeletePath = null
         showPhrase = false
@@ -224,10 +241,12 @@ class MainActivity : ComponentActivity() {
             navigate(Screen.PHRASE)
             return
         }
+        prefs.protectionOn = true
         message = KeywordListenerService.start(this)
     }
 
     private fun turnProtectionOff() {
+        prefs.protectionOn = false
         message = null
         KeywordListenerService.stop(this)
     }
@@ -253,6 +272,8 @@ class MainActivity : ComponentActivity() {
                 start()
             }
             playingPath = file.path
+            playedSinceRestart = true
+            KeywordListenerService.setPlaybackActive(true)
         } catch (e: Exception) {
             Log.e(TAG, "Playback failed", e)
             stopPlayback()
@@ -260,7 +281,39 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Fully restarts the listener (same as turning protection off and on).
+     * Done after audio was played, because on some devices / the emulator the
+     * microphone stops delivering sound after playback.
+     */
+    private fun restartListening() {
+        val state = KeywordListenerService.state.value
+        // Don't interrupt a recording that is in progress.
+        if (!prefs.protectionOn || state == State.STOPPED || state == State.RECORDING) return
+        Log.i(TAG, "Restarting listener after playback")
+        KeywordListenerService.stop(this)
+        startWhenStopped(attempt = 0)
+    }
+
+    /** Waits until the old listener has fully stopped, then starts a new one. */
+    private fun startWhenStopped(attempt: Int) {
+        window.decorView.postDelayed({
+            if (!prefs.protectionOn) return@postDelayed
+            if (KeywordListenerService.state.value == State.STOPPED) {
+                KeywordListenerService.start(this)?.let { message = it }
+            } else if (attempt < 20) {
+                startWhenStopped(attempt + 1)
+            }
+        }, 300)
+    }
+
+    private fun togglePreRoll() {
+        prefs.includePreRoll = !prefs.includePreRoll
+        settingsVersion++
+    }
+
     private fun stopPlayback() {
+        KeywordListenerService.setPlaybackActive(false)
         try { player?.release() } catch (_: Exception) { }
         player = null
         playingPath = null
@@ -290,6 +343,7 @@ class MainActivity : ComponentActivity() {
         val serviceError by KeywordListenerService.error.collectAsState()
         val startedAt by KeywordListenerService.recordingStartedAt.collectAsState()
         val heard by KeywordListenerService.heard.collectAsState()
+        val pausedForAudio by KeywordListenerService.paused.collectAsState()
 
         val recordings = remember(serviceState, recordingsVersion) {
             KeywordListenerService.listRecordings(this@MainActivity)
@@ -332,7 +386,7 @@ class MainActivity : ComponentActivity() {
                                     item { Body("SafeGuardAI records audio when you say a secret phrase.") }
                                     item { Body("• Listening happens only on this watch.") }
                                     item { Body("• Nothing is saved until you say your phrase.") }
-                                    item { Body("• The 5 seconds before the phrase are included.") }
+                                    item { Body("• You can choose to include the 5 seconds before the phrase.") }
                                     item { Body("• You can turn it off or withdraw consent any time.") }
                                     item { Body("Recording laws differ by place. Check what applies to you.", small = true) }
                                     shownMessage?.let { m -> item { Note(m) } }
@@ -378,7 +432,9 @@ class MainActivity : ComponentActivity() {
                                         when (serviceState) {
                                             State.STOPPED -> Status("Protection is off")
                                             State.LOADING -> Status("Starting…")
-                                            State.LISTENING -> Status("Listening for your phrase")
+                                            State.LISTENING ->
+                                                if (pausedForAudio) Status("Paused – audio playing")
+                                                else Status("Listening for your phrase")
                                             State.RECORDING -> {
                                                 val secs = ((now - startedAt).coerceAtLeast(0) / 1000).toInt()
                                                 Status("● REC  %d:%02d".format(secs / 60, secs % 60), RecordingRed)
@@ -414,6 +470,9 @@ class MainActivity : ComponentActivity() {
                                 // ================= RECORDINGS =================
                                 Screen.RECORDINGS -> {
                                     item { Header("Recordings") }
+                                    if (playingPath != null) {
+                                        item { Note("Phrase detection paused while playing") }
+                                    }
                                     shownMessage?.let { m -> item { Note(m) } }
                                     if (recordings.isEmpty()) {
                                         item { Body("No recordings yet. Turn protection on and say your phrase.") }
@@ -454,6 +513,12 @@ class MainActivity : ComponentActivity() {
                                             onClick = { showPhrase = !showPhrase })
                                     }
                                     item { Action("Change phrase", onClick = { navigate(Screen.PHRASE) }) }
+                                    item {
+                                        val includeBefore = remember(settingsVersion) { prefs.includePreRoll }
+                                        Action("Include 5 s before phrase",
+                                            secondary = if (includeBefore) "On – tap to turn off" else "Off – tap to turn on",
+                                            onClick = ::togglePreRoll)
+                                    }
                                     item { Action("Withdraw consent", danger = true, onClick = ::withdrawConsent) }
                                     item { Action("Back", onClick = { navigate(Screen.HOME) }) }
                                 }

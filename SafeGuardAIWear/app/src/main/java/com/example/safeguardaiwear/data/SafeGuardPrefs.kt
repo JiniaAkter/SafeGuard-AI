@@ -33,10 +33,25 @@ class SafeGuardPrefs(context: Context) {
             prefs.edit().putString(KEY_PHRASE, value).apply()
         }
 
+    /** Include the 5 seconds before the phrase in recordings (default: yes). */
+    var includePreRoll: Boolean
+        get() = prefs.getBoolean(KEY_PRE_ROLL, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PRE_ROLL, value).apply()
+        }
+
+    /** The user turned protection on (kept so listening restarts automatically). */
+    var protectionOn: Boolean
+        get() = prefs.getBoolean(KEY_PROTECTION_ON, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_PROTECTION_ON, value).apply()
+        }
+
     fun withdrawConsent() {
         prefs.edit()
             .putBoolean(KEY_CONSENT, false)
             .putLong(KEY_CONSENT_TIME, 0L)
+            .putBoolean(KEY_PROTECTION_ON, false)
             .apply()
     }
 
@@ -44,6 +59,8 @@ class SafeGuardPrefs(context: Context) {
         private const val KEY_CONSENT = "consent_given"
         private const val KEY_CONSENT_TIME = "consent_time"
         private const val KEY_PHRASE = "secret_phrase"
+        private const val KEY_PRE_ROLL = "include_pre_roll"
+        private const val KEY_PROTECTION_ON = "protection_on"
 
         const val MIN_WORDS = 2
         const val MAX_WORDS = 4
