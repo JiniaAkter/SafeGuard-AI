@@ -1,0 +1,8 @@
+numpy
+scipy
+scikit-learn
+librosa
+matplotlib
+ai-edge-litert
+pandas
+openpyxl
